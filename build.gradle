@@ -31,6 +31,7 @@ buildscript {
 }
 
 plugins {
+  id 'maven-publish'
   id 'com.github.ben-manes.versions' version '0.48.0'
   id 'idea'
   id 'jacoco'
@@ -315,6 +316,7 @@ subprojects {
   apply plugin: 'java-library'
   apply plugin: 'checkstyle'
   apply plugin: "com.github.spotbugs"
+  apply plugin: 'maven-publish'
 
   // We use the shadow plugin for the jmh-benchmarks module and the `-all` jar can get pretty large, so
   // don't publish it
