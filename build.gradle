@@ -188,9 +188,6 @@ allprojects {
   }
 
   configurations.all {
-    resolutionStrategy.capabilitiesResolution.withCapability("org.lz4:lz4-java") {
-      select("at.yawk.lz4:lz4-java:1.10.1")
-    }
     // zinc is the Scala incremental compiler, it has a configuration for its own dependencies
     // that are unrelated to the project dependencies, we should not change them
     if (name != "zinc") {
