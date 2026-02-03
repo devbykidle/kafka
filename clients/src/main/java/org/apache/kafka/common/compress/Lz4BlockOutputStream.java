@@ -16,13 +16,13 @@
  */
 package org.apache.kafka.common.compress;
 
-import org.apache.kafka.common.record.CompressionType;
-import org.apache.kafka.common.utils.ByteUtils;
-
 import net.jpountz.lz4.LZ4Compressor;
 import net.jpountz.lz4.LZ4Factory;
 import net.jpountz.xxhash.XXHash32;
 import net.jpountz.xxhash.XXHashFactory;
+import org.apache.kafka.common.record.CompressionType;
+import org.apache.kafka.common.utils.ByteUtils;
+
 
 import java.io.IOException;
 import java.io.OutputStream;
