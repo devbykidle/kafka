@@ -1,0 +1,151 @@
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+stages:
+  - build
+  - scan
+
+variables:
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false"
+  TRIVY_SEVERITY: "HIGH,CRITICAL"
+  TRIVY_EXIT_CODE: "1"
+  TRIVY_CACHE_DIR: "$CI_PROJECT_DIR/.trivycache"
+  # Used by local docs / defaults; matrix below is the source of truth for manual builds.
+  KAFKA_TAGS: "4.1.0 4.2.0"
+
+.gradle_job:
+  image: eclipse-temurin:17-jdk
+  cache:
+    key: gradle-kafka
+    paths:
+      - .gradle/caches
+      - .gradle/wrapper
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git tar gzip ca-certificates
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    - chmod +x gradlew scripts/build-release-archive.sh || true
+
+# Build release archive for the current checkout (tag push / branch HEAD).
+build:release-current:
+  extends: .gradle_job
+  stage: build
+  script:
+    - mkdir -p dist
+    - scripts/build-release-archive.sh --skip-install --skip-trivy --output-dir "dist/${CI_COMMIT_TAG:-${CI_COMMIT_REF_NAME}}"
+    - |
+      echo "Built archive(s):"
+      ls -lh dist/*/*.tgz
+  artifacts:
+    name: "kafka-${CI_COMMIT_TAG:-${CI_COMMIT_REF_SLUG}}-${CI_PIPELINE_ID}"
+    paths:
+      - dist/
+    expire_in: 30 days
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/
+    - if: $CI_COMMIT_BRANCH
+      when: manual
+      allow_failure: true
+
+# Manual matrix: checkout historical tags (e.g. 4.1.0 / 4.2.0) via worktree and build archives.
+build:release-tag:
+  extends: .gradle_job
+  stage: build
+  variables:
+    GIT_DEPTH: "0"
+  parallel:
+    matrix:
+      - KAFKA_TAG:
+          - "4.1.0"
+          - "4.2.0"
+  script:
+    - git fetch --tags --force origin || git fetch --tags --force
+    - |
+      if ! git rev-parse -q --verify "refs/tags/${KAFKA_TAG}" >/dev/null; then
+        echo "error: tag ${KAFKA_TAG} not found" >&2
+        exit 1
+      fi
+    - mkdir -p .worktrees dist
+    - |
+      WORKTREE="${CI_PROJECT_DIR}/.worktrees/${KAFKA_TAG}"
+      if [[ -d "$WORKTREE" ]]; then
+        git -C "$WORKTREE" checkout --force "$KAFKA_TAG"
+      else
+        git worktree add --force "$WORKTREE" "$KAFKA_TAG"
+      fi
+    - scripts/build-release-archive.sh --workdir ".worktrees/${KAFKA_TAG}" --skip-install --skip-trivy --output-dir "dist/${KAFKA_TAG}"
+    - ls -lh "dist/${KAFKA_TAG}/"
+  artifacts:
+    name: "kafka-${KAFKA_TAG}-${CI_PIPELINE_ID}"
+    paths:
+      - dist/${KAFKA_TAG}/
+    expire_in: 30 days
+  rules:
+    - if: $CI_COMMIT_BRANCH
+      when: manual
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+
+# Scan built archives with Trivy (expects dist/<version>/*.tgz from build jobs).
+scan:trivy:
+  stage: scan
+  image:
+    name: aquasec/trivy:0.66.0
+    entrypoint: [""]
+  needs:
+    - job: build:release-tag
+      optional: true
+      artifacts: true
+    - job: build:release-current
+      optional: true
+      artifacts: true
+  cache:
+    key: trivy
+    paths:
+      - .trivycache
+  script:
+    - |
+      set -euo pipefail
+      if ! ls dist/*/*.tgz >/dev/null 2>&1; then
+        echo "No release archives found under dist/; nothing to scan."
+        exit 0
+      fi
+      scan_status=0
+      mkdir -p dist/trivy
+      for tarball in dist/*/*.tgz; do
+        version="$(basename "$(dirname "$tarball")")"
+        echo "==> Scanning ${tarball}"
+        SCAN_DIR="$(mktemp -d)"
+        tar -xzf "$tarball" -C "$SCAN_DIR"
+        report="dist/trivy/trivy-kafka-${version}.json"
+        trivy fs \
+          --no-progress \
+          --scanners vuln \
+          --severity "$TRIVY_SEVERITY" \
+          --exit-code "$TRIVY_EXIT_CODE" \
+          --format json \
+          --output "$report" \
+          "$SCAN_DIR" || scan_status=$?
+        trivy fs \
+          --no-progress \
+          --scanners vuln \
+          --severity "$TRIVY_SEVERITY" \
+          --format table \
+          "$SCAN_DIR"
+        rm -rf "$SCAN_DIR"
+      done
+      exit "$scan_status"
+  artifacts:
+    when: always
+    name: "trivy-kafka-${CI_PIPELINE_ID}"
+    paths:
+      - dist/trivy/
+    expire_in: 30 days
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/
+    - if: $CI_COMMIT_BRANCH
+      when: manual
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
