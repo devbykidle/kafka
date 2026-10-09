@@ -212,7 +212,7 @@ allprojects {
     options.addStringOption('Xdoclint:none', '-quiet')
     // Javadoc warnings should fail the build in JDK 15+ https://bugs.openjdk.org/browse/JDK-8200363
     options.addBooleanOption('Werror', JavaVersion.current().isCompatibleWith(JavaVersion.VERSION_15))
-    options.links "https://docs.oracle.com/en/java/javase/${JavaVersion.current().majorVersion}/docs/api/"
+    //options.links "https://docs.oracle.com/en/java/javase/${JavaVersion.current().majorVersion}/docs/api/"
   }
 
   tasks.withType(Checkstyle) {
