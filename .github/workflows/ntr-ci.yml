@@ -1,0 +1,168 @@
+# NTR: build Kafka distribution, scan with Trivy, publish archive for Strimzi.
+name: NTR CI
+
+on:
+  push:
+    branches: ["ntr/**"]
+    tags: ["ntr/**"]
+  pull_request:
+    branches: ["ntr/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: ntr-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: "17"
+  TRIVY_SEVERITY: "HIGH,CRITICAL"
+  TRIVY_EXIT_CODE: "1"
+
+jobs:
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      scala_base: ${{ steps.meta.outputs.scala_base }}
+      tarball: ${{ steps.meta.outputs.tarball }}
+      checksum: ${{ steps.meta.outputs.checksum }}
+      asset_name: ${{ steps.meta.outputs.asset_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Build release tar.gz
+        run: ./gradlew -PskipSigning=true releaseTarGz -x test
+
+      - name: Resolve artifact metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -E '^version=' gradle.properties | cut -d= -f2)"
+          SCALA_BASE="$(grep -E '^scalaVersion=' gradle.properties | cut -d= -f2 | cut -d. -f1-2)"
+          ASSET_NAME="kafka_${SCALA_BASE}-${VERSION}.tgz"
+          TARBALL="core/build/distributions/${ASSET_NAME}"
+          test -f "$TARBALL"
+          CHECKSUM="$(sha512sum "$TARBALL" | awk '{print toupper($1)}')"
+          {
+            echo "version=${VERSION}"
+            echo "scala_base=${SCALA_BASE}"
+            echo "tarball=${TARBALL}"
+            echo "asset_name=${ASSET_NAME}"
+            echo "checksum=${CHECKSUM}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Kafka ${VERSION} archive: ${ASSET_NAME}"
+          echo "SHA512: ${CHECKSUM}"
+          echo "${CHECKSUM}  ${ASSET_NAME}" > "${ASSET_NAME}.sha512"
+          cp "$TARBALL" "$ASSET_NAME"
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kafka-dist
+          path: |
+            ${{ steps.meta.outputs.asset_name }}
+            ${{ steps.meta.outputs.asset_name }}.sha512
+          if-no-files-found: error
+
+  scan:
+    name: Trivy scan
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: kafka-dist
+          path: dist
+
+      - name: Extract archive for filesystem scan
+        run: |
+          set -euo pipefail
+          mkdir -p scan-root
+          tar -xzf "dist/${{ needs.build.outputs.asset_name }}" -C scan-root
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          scan-type: fs
+          scan-ref: scan-root
+          severity: ${{ env.TRIVY_SEVERITY }}
+          exit-code: ${{ env.TRIVY_EXIT_CODE }}
+          format: json
+          output: trivy-kafka-dist.json
+
+      - name: Trivy table report
+        if: always()
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          scan-type: fs
+          scan-ref: scan-root
+          severity: ${{ env.TRIVY_SEVERITY }}
+          exit-code: "0"
+          format: table
+
+      - name: Upload Trivy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-kafka-dist
+          path: trivy-kafka-dist.json
+
+  publish:
+    name: Publish GitHub Release archive
+    needs: [build, scan]
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: kafka-dist
+          path: dist
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          # Release asset URL in kafka-versions.yaml uses the version tag, e.g. 4.2.0
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            # ntr/4.2.0 -> 4.2.0 (keep plain version tags as-is)
+            TAG="${{ github.ref_name }}"
+            TAG="${TAG#ntr/}"
+            echo "name=${TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${{ needs.build.outputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: Kafka ${{ needs.build.outputs.version }} (NTR)
+          draft: false
+          prerelease: ${{ github.ref_type != 'tag' }}
+          generate_release_notes: true
+          files: |
+            dist/${{ needs.build.outputs.asset_name }}
+            dist/${{ needs.build.outputs.asset_name }}.sha512
+          body: |
+            NTR Kafka distribution for Strimzi.
+
+            Download URL for `kafka-versions.yaml`:
+            ```
+            https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/${{ needs.build.outputs.asset_name }}
+            ```
+
+            SHA512: `${{ needs.build.outputs.checksum }}`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
